@@ -1,0 +1,84 @@
+name: Mirror A -> B & C
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  create:
+  delete:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"  # 每天凌晨 3 点补偿执行
+
+permissions:
+  contents: read  # 读取 A 仓库；推送到 B/C 用 PAT
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # 防抖：同一时间只跑一个镜像任务，避免频繁提交导致并发冲突
+    concurrency:
+      group: mirror-all
+      cancel-in-progress: true
+
+    steps:
+      - name: Prepare git
+        run: |
+          git config --global user.name "repo-mirror-bot"
+          git config --global user.email "actions@users.noreply.github.com"
+          git config --global advice.detachedHead false
+          git config --global init.defaultBranch main
+
+      - name: Clone source (bare mirror)
+        env:
+          SRC_URL: https://x-access-token:${{ secrets.AREPO_TOKEN_READONLY }}@github.com/lilong7676/ARepoForTestGithubApi.git
+        run: |
+          set -euo pipefail
+          rm -rf mirror.git
+          git clone --mirror "$SRC_URL" mirror.git
+          cd mirror.git
+          # 删除 GitHub 的 PR 引用，避免推送到目标仓库
+          git for-each-ref --format='%(refname)' 'refs/pull' | xargs -r -n 1 git update-ref -d
+          # 保守起见再清理任何远端跟踪引用（mirror 克隆通常不会生成 refs/remotes/*，此处容错）
+          git for-each-ref --format='%(refname)' 'refs/remotes' | xargs -r -n 1 git update-ref -d
+
+      - name: Add remote B
+        env:
+          B_URL: https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/lilong7676/ARepoForTestGithubApi_1.git
+        run: |
+          cd mirror.git
+          git remote add b "$B_URL"
+
+      - name: Add remote C
+        env:
+          C_URL: https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/lilong7676/ARepoForTestGithubApi_2.git
+        run: |
+          cd mirror.git
+          git remote add c "$C_URL"
+
+      - name: Push all refs to B (mirror + prune)
+        run: |
+          set -euo pipefail
+          cd mirror.git
+          # 镜像包含所有分支、标签、notes，并传播删除与非快进更新
+          git push --mirror --prune b
+
+      - name: Push all refs to C (mirror + prune)
+        run: |
+          set -euo pipefail
+          cd mirror.git
+          git push --mirror --prune c
+
+      - name: Optional - Git LFS sync to B and C
+        if: ${{ always() }}  # 可按需改为条件启用
+        run: |
+          set -euo pipefail
+          cd mirror.git
+          sudo apt-get update -y
+          sudo apt-get install -y git-lfs
+          git lfs install
+          # 获取源仓库全部 LFS 对象
+          git lfs fetch --all
+          # 将 LFS 对象推送到目标（与 refs 镜像匹配）
+          git lfs push --all b || true
+          git lfs push --all c || true
